@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import math
 import random
 import string
 import argparse
@@ -15,9 +14,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
+import numpy as np
+import faiss
+import torch
 
 from tqdm import tqdm
 from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
 
 
 # ============================================================
@@ -26,58 +29,54 @@ from datasets import load_dataset
 
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
-OPENROUTER_URL = (
-    "https://openrouter.ai/api/v1/chat/completions"
-)
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 DEFAULT_MODEL = "google/gemini-2.5-flash"
 
-SEED = 42
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
+SEED = 42
 DEFAULT_N = 100
 
-MAX_SEARCH_RESULTS = 5
+TOP_K = 5
 
 MAX_DOC_CHARS = 1800
 
 MAX_REACT_STEPS = 6
 
-# 병렬 decomposition에서 최대 몇 개 subquery
 MAX_PARALLEL_QUERIES = 4
 
-# 전체 QA sample 동시 실행 개수
-DEFAULT_WORKERS = 20
+# sample-level parallelism
+DEFAULT_WORKERS = 8
 
-# 한 sample 내 parallel search worker
+# 한 질문 내부 sub-query 병렬 retrieval
 SEARCH_WORKERS = 4
-
-MAX_RETRIES = 6
-RETRY_BASE_SECONDS = 1.5
 
 DEBUG = False
 
+OPENROUTER_MAX_RETRIES = 6
+OPENROUTER_RETRY_BASE = 1.5
+
+CACHE_DIR = "./hotpot_local_index"
+
+INDEX_PATH = os.path.join(
+    CACHE_DIR,
+    "hotpot_validation.faiss",
+)
+
+CORPUS_PATH = os.path.join(
+    CACHE_DIR,
+    "hotpot_validation_corpus.json",
+)
+
 
 # ============================================================
-# THREAD LOCAL SESSION
+# GLOBAL RETRIEVAL OBJECTS
 # ============================================================
 
-_local = threading.local()
-
-
-def get_session():
-
-    if not hasattr(_local, "session"):
-
-        session = requests.Session()
-
-        session.headers.update({
-            "User-Agent":
-                "parallel-vs-react-hotpotqa/0.1"
-        })
-
-        _local.session = session
-
-    return _local.session
+embedder = None
+faiss_index = None
+corpus = None
 
 
 # ============================================================
@@ -87,7 +86,6 @@ def get_session():
 class RunStats:
 
     def __init__(self):
-
         self.llm_calls = 0
         self.search_calls = 0
 
@@ -99,11 +97,7 @@ class RunStats:
 
         self.executed_steps = 0
 
-        # 실제 search들의 latency를 합친 값
-        self.sum_individual_search_latency = 0.0
-
     def to_dict(self):
-
         return vars(self).copy()
 
 
@@ -118,34 +112,29 @@ def call_llm(
     max_tokens=500,
     temperature=0.0,
 ):
-
     last_error = None
 
-    for attempt in range(MAX_RETRIES):
-
+    for attempt in range(
+        OPENROUTER_MAX_RETRIES
+    ):
         start = time.perf_counter()
 
         try:
-
             response = requests.post(
                 OPENROUTER_URL,
-
                 headers={
                     "Authorization":
                         f"Bearer {OPENROUTER_API_KEY}",
-
                     "Content-Type":
                         "application/json",
                 },
-
                 json={
-                    "model": model,
-
-                    "messages": messages,
-
+                    "model":
+                        model,
+                    "messages":
+                        messages,
                     "temperature":
                         temperature,
-
                     "max_tokens":
                         max_tokens,
 
@@ -154,7 +143,6 @@ def call_llm(
                         "enabled": False
                     },
                 },
-
                 timeout=120,
             )
 
@@ -166,19 +154,11 @@ def call_llm(
             stats.llm_calls += 1
             stats.llm_latency += elapsed
 
-            # --------------------------------------------
-            # success
-            # --------------------------------------------
-
             if response.status_code == 200:
-
                 data = response.json()
 
                 usage = (
-                    data.get(
-                        "usage",
-                        {}
-                    )
+                    data.get("usage", {})
                     or {}
                 )
 
@@ -200,46 +180,62 @@ def call_llm(
 
                 content = (
                     data["choices"][0]
-                    ["message"]["content"]
+                    ["message"]
+                    ["content"]
                 )
 
                 if DEBUG:
-
                     print()
-                    print("[LLM]")
+                    print("[LLM RESPONSE]")
                     print(content[:2000])
 
                 return content
-
-            # --------------------------------------------
-            # retry
-            # --------------------------------------------
 
             if (
                 response.status_code == 429
                 or
                 response.status_code >= 500
             ):
-
                 last_error = (
                     f"{response.status_code}: "
                     f"{response.text[:1000]}"
                 )
 
-                wait = (
-                    RETRY_BASE_SECONDS
-                    *
-                    (2 ** attempt)
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
+                )
+
+                wait = None
+
+                if retry_after:
+                    try:
+                        wait = float(
+                            retry_after
+                        )
+                    except Exception:
+                        pass
+
+                if wait is None:
+                    wait = (
+                        OPENROUTER_RETRY_BASE
+                        *
+                        (2 ** attempt)
+                    )
+
+                wait += random.uniform(
+                    0,
+                    0.5,
                 )
 
                 print(
-                    f"[LLM RETRY] "
-                    f"status="
-                    f"{response.status_code} "
+                    f"[OPENROUTER RETRY] "
+                    f"status={response.status_code} "
                     f"attempt="
                     f"{attempt + 1}/"
-                    f"{MAX_RETRIES} "
-                    f"sleep={wait:.1f}"
+                    f"{OPENROUTER_MAX_RETRIES} "
+                    f"sleep={wait:.2f}s"
                 )
 
                 time.sleep(wait)
@@ -247,19 +243,31 @@ def call_llm(
                 continue
 
             raise RuntimeError(
-                f"OpenRouter "
+                f"OpenRouter error "
                 f"{response.status_code}: "
                 f"{response.text[:2000]}"
             )
 
         except requests.RequestException as e:
-
             last_error = repr(e)
 
             wait = (
-                RETRY_BASE_SECONDS
+                OPENROUTER_RETRY_BASE
                 *
                 (2 ** attempt)
+                +
+                random.uniform(
+                    0,
+                    0.5,
+                )
+            )
+
+            print(
+                f"[OPENROUTER NETWORK RETRY] "
+                f"attempt="
+                f"{attempt + 1}/"
+                f"{OPENROUTER_MAX_RETRIES} "
+                f"sleep={wait:.2f}s"
             )
 
             time.sleep(wait)
@@ -275,6 +283,7 @@ def call_llm(
 # ============================================================
 
 def extract_json(text):
+    original = text
 
     text = text.strip()
 
@@ -292,272 +301,530 @@ def extract_json(text):
     )
 
     try:
-
         return json.loads(text)
-
     except Exception:
-
         pass
 
-    obj_start = text.find("{")
-    obj_end = text.rfind("}")
+    start = text.find("{")
+    end = text.rfind("}")
 
     if (
-        obj_start >= 0
+        start >= 0
         and
-        obj_end > obj_start
+        end > start
     ):
-
         candidate = text[
-            obj_start:
-            obj_end + 1
+            start:
+            end + 1
         ]
 
         try:
-
             return json.loads(
                 candidate
             )
-
         except Exception:
-
             pass
+
+    print()
+    print("[JSON PARSE ERROR]")
+    print(original[:4000])
 
     raise ValueError(
         f"Could not parse JSON:\n"
-        f"{text[:3000]}"
+        f"{original[:4000]}"
     )
 
 
 # ============================================================
-# WIKIPEDIA SEARCH
+# DATASET
 # ============================================================
 
-WIKI_API = (
-    "https://en.wikipedia.org/w/api.php"
-)
+def load_hotpot_validation():
+    print()
+    print("=" * 100)
+    print("LOAD HOTPOTQA VALIDATION")
+    print("=" * 100)
+
+    ds = load_dataset(
+        "hotpotqa/hotpot_qa",
+        "distractor",
+        split="validation",
+    )
+
+    print(
+        "validation rows:",
+        len(ds)
+    )
+
+    return ds
 
 
-def wikipedia_search(
+def load_hotpot_comparison(
+    ds,
+    n=100,
+    seed=42,
+):
+    comparison = ds.filter(
+        lambda x:
+            x["type"]
+            ==
+            "comparison"
+    )
+
+    print(
+        "comparison rows:",
+        len(comparison)
+    )
+
+    comparison = (
+        comparison
+        .shuffle(seed=seed)
+    )
+
+    n = min(
+        n,
+        len(comparison)
+    )
+
+    comparison = (
+        comparison
+        .select(
+            range(n)
+        )
+    )
+
+    samples = []
+
+    for row in comparison:
+        samples.append({
+            "id":
+                str(
+                    row["id"]
+                ),
+
+            "question":
+                str(
+                    row["question"]
+                ),
+
+            "answer":
+                str(
+                    row["answer"]
+                ),
+
+            "type":
+                str(
+                    row["type"]
+                ),
+
+            "level":
+                str(
+                    row["level"]
+                ),
+        })
+
+    print()
+    print(
+        f"selected={len(samples)} "
+        f"seed={seed}"
+    )
+
+    print()
+    print("[FIRST 5]")
+
+    for x in samples[:5]:
+        print()
+        print(
+            "Q:",
+            x["question"]
+        )
+        print(
+            "A:",
+            x["answer"]
+        )
+
+    return samples
+
+
+# ============================================================
+# BUILD LOCAL CORPUS
+# ============================================================
+
+def build_corpus(ds):
+    docs = {}
+
+    print()
+    print("=" * 100)
+    print("BUILD DOCUMENT CORPUS")
+    print("=" * 100)
+
+    for row in tqdm(
+        ds,
+        desc="collect corpus",
+    ):
+        context = row["context"]
+
+        titles = (
+            context["title"]
+        )
+
+        sentences_list = (
+            context["sentences"]
+        )
+
+        for title, sentences in zip(
+            titles,
+            sentences_list,
+        ):
+            title = str(
+                title
+            ).strip()
+
+            text = " ".join(
+                sentences
+            ).strip()
+
+            if not title:
+                continue
+
+            if not text:
+                continue
+
+            # title 단위 unique corpus
+            if title not in docs:
+                docs[title] = {
+                    "title":
+                        title,
+
+                    "text":
+                        text,
+                }
+
+    result = list(
+        docs.values()
+    )
+
+    print(
+        "unique documents:",
+        len(result)
+    )
+
+    return result
+
+
+# ============================================================
+# EMBEDDING / FAISS
+# ============================================================
+
+def initialize_embedder(
+    device=None,
+):
+    global embedder
+
+    if device is None:
+        device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else
+            "cpu"
+        )
+
+    print()
+    print("=" * 100)
+    print("LOAD EMBEDDING MODEL")
+    print("=" * 100)
+
+    print(
+        "model :",
+        EMBED_MODEL_NAME
+    )
+
+    print(
+        "device:",
+        device
+    )
+
+    embedder = (
+        SentenceTransformer(
+            EMBED_MODEL_NAME,
+            device=device,
+        )
+    )
+
+
+def build_faiss_index(
+    corpus_data,
+    batch_size=256,
+):
+    global faiss_index
+
+    texts = [
+        (
+            f"{d['title']}. "
+            f"{d['text']}"
+        )
+        for d in corpus_data
+    ]
+
+    print()
+    print("=" * 100)
+    print("EMBED CORPUS")
+    print("=" * 100)
+
+    embeddings = (
+        embedder.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+    )
+
+    embeddings = (
+        embeddings.astype(
+            "float32"
+        )
+    )
+
+    dim = (
+        embeddings.shape[1]
+    )
+
+    print(
+        "embedding shape:",
+        embeddings.shape
+    )
+
+    # cosine similarity
+    # normalized embeddings + inner product
+    index = (
+        faiss.IndexFlatIP(
+            dim
+        )
+    )
+
+    index.add(
+        embeddings
+    )
+
+    faiss_index = index
+
+    return index
+
+
+def save_index_and_corpus():
+    os.makedirs(
+        CACHE_DIR,
+        exist_ok=True,
+    )
+
+    faiss.write_index(
+        faiss_index,
+        INDEX_PATH,
+    )
+
+    with open(
+        CORPUS_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            corpus,
+            f,
+            ensure_ascii=False,
+        )
+
+    print()
+    print(
+        "[INDEX SAVED]",
+        INDEX_PATH
+    )
+
+    print(
+        "[CORPUS SAVED]",
+        CORPUS_PATH
+    )
+
+
+def load_cached_index():
+    global faiss_index
+    global corpus
+
+    if (
+        not os.path.exists(
+            INDEX_PATH
+        )
+        or
+        not os.path.exists(
+            CORPUS_PATH
+        )
+    ):
+        return False
+
+    print()
+    print("=" * 100)
+    print("LOAD CACHED INDEX")
+    print("=" * 100)
+
+    faiss_index = (
+        faiss.read_index(
+            INDEX_PATH
+        )
+    )
+
+    with open(
+        CORPUS_PATH,
+        "r",
+        encoding="utf-8",
+    ) as f:
+        corpus = json.load(
+            f
+        )
+
+    print(
+        "index docs:",
+        faiss_index.ntotal
+    )
+
+    print(
+        "corpus docs:",
+        len(corpus)
+    )
+
+    if (
+        faiss_index.ntotal
+        !=
+        len(corpus)
+    ):
+        raise RuntimeError(
+            "FAISS index and corpus "
+            "size mismatch"
+        )
+
+    return True
+
+
+# ============================================================
+# LOCAL RETRIEVAL
+# ============================================================
+
+def local_search(
+    query,
+    top_k=TOP_K,
+):
+    q = embedder.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+    q = q.astype(
+        "float32"
+    )
+
+    scores, ids = (
+        faiss_index.search(
+            q,
+            top_k,
+        )
+    )
+
+    docs = []
+
+    for rank, (
+        idx,
+        score,
+    ) in enumerate(
+        zip(
+            ids[0],
+            scores[0],
+        ),
+        start=1,
+    ):
+        if idx < 0:
+            continue
+
+        item = (
+            corpus[
+                int(idx)
+            ]
+        )
+
+        docs.append({
+            "rank":
+                rank,
+
+            "title":
+                item["title"],
+
+            "text":
+                item["text"][
+                    :MAX_DOC_CHARS
+                ],
+
+            "score":
+                float(score),
+        })
+
+    return docs
+
+
+def retrieve(
     query,
     stats,
-    top_k=MAX_SEARCH_RESULTS,
+    top_k=TOP_K,
 ):
-
-    total_start = (
+    start = (
         time.perf_counter()
     )
 
     stats.search_calls += 1
 
-    session = get_session()
+    docs = local_search(
+        query,
+        top_k=top_k,
+    )
 
-    try:
+    stats.search_latency += (
+        time.perf_counter()
+        -
+        start
+    )
 
-        # --------------------------------------------
-        # search
-        # --------------------------------------------
-
-        response = session.get(
-            WIKI_API,
-
-            params={
-                "action":
-                    "query",
-
-                "format":
-                    "json",
-
-                "list":
-                    "search",
-
-                "srsearch":
-                    query,
-
-                "srlimit":
-                    top_k,
-
-                "utf8":
-                    1,
-            },
-
-            timeout=30,
+    if DEBUG:
+        print()
+        print(
+            "[LOCAL SEARCH]",
+            query
         )
 
-        response.raise_for_status()
-
-        hits = (
-            response.json()
-            .get(
-                "query",
-                {}
-            )
-            .get(
-                "search",
-                []
-            )
-        )
-
-        if not hits:
-
-            return []
-
-        titles = [
-            hit["title"]
-            for hit in hits
-        ]
-
-        # --------------------------------------------
-        # extracts
-        # --------------------------------------------
-
-        response2 = session.get(
-            WIKI_API,
-
-            params={
-                "action":
-                    "query",
-
-                "format":
-                    "json",
-
-                "prop":
-                    "extracts",
-
-                "explaintext":
-                    1,
-
-                "redirects":
-                    1,
-
-                "titles":
-                    "|".join(titles),
-            },
-
-            timeout=30,
-        )
-
-        response2.raise_for_status()
-
-        pages = (
-            response2.json()
-            .get(
-                "query",
-                {}
-            )
-            .get(
-                "pages",
-                {}
-            )
-        )
-
-        title_to_extract = {}
-
-        for page in pages.values():
-
-            title = page.get(
-                "title",
-                ""
-            )
-
-            extract = page.get(
-                "extract",
-                ""
-            )
-
-            title_to_extract[
-                title.lower()
-            ] = extract
-
-        docs = []
-
-        for rank, hit in enumerate(
-            hits,
-            start=1,
-        ):
-
-            title = hit[
-                "title"
-            ]
-
-            text = (
-                title_to_extract.get(
-                    title.lower(),
-                    "",
-                )
-            )
-
-            if not text:
-
-                text = re.sub(
-                    "<.*?>",
-                    " ",
-                    hit.get(
-                        "snippet",
-                        ""
-                    ),
-                )
-
-            docs.append({
-                "rank":
-                    rank,
-
-                "title":
-                    title,
-
-                "text":
-                    text[:MAX_DOC_CHARS],
-            })
-
-        if DEBUG:
-
-            print()
+        for d in docs:
             print(
-                f"[SEARCH] {query}"
+                d["rank"],
+                f"{d['score']:.4f}",
+                d["title"]
             )
 
-            for d in docs[:3]:
-
-                print(
-                    d["rank"],
-                    d["title"]
-                )
-
-        return docs
-
-    finally:
-
-        elapsed = (
-            time.perf_counter()
-            -
-            total_start
-        )
-
-        stats.search_latency += (
-            elapsed
-        )
-
-        stats.sum_individual_search_latency += (
-            elapsed
-        )
+    return docs
 
 
 def docs_to_text(
     query,
     docs,
 ):
-
     chunks = [
         f"SEARCH QUERY: {query}"
     ]
 
-    for doc in docs:
-
+    for d in docs:
         chunks.append(
             (
-                f"[{doc['rank']}] "
-                f"{doc['title']}\n"
-                f"{doc['text']}"
+                f"[{d['rank']}] "
+                f"{d['title']} "
+                f"(score={d['score']:.4f})\n"
+                f"{d['text']}"
             )
         )
 
@@ -567,7 +834,7 @@ def docs_to_text(
 
 
 # ============================================================
-# ANSWER
+# FINAL ANSWER
 # ============================================================
 
 FINAL_ANSWER_PROMPT = """
@@ -577,10 +844,10 @@ Rules:
 - Give only the shortest correct answer.
 - Do not explain your reasoning.
 - Do not prefix with "The answer is".
-- For yes/no questions, output exactly "yes" or "no".
-- For comparison questions, perform the comparison using the evidence.
+- For yes/no questions output exactly "yes" or "no".
+- For comparison questions perform the comparison using the evidence.
 - If the answer is a person/entity, output only that entity.
-- Do not mention uncertainty unless absolutely necessary.
+- Do not add unnecessary prose.
 
 Question:
 {question}
@@ -596,7 +863,6 @@ def generate_final_answer(
     stats,
     model,
 ):
-
     return call_llm(
         [
             {
@@ -630,20 +896,20 @@ def generate_final_answer(
 
 # ============================================================
 # METHOD 1
-# VANILLA DECOMPOSE -> PARALLEL SEARCH
+# ONE-SHOT DECOMPOSITION -> PARALLEL RETRIEVAL
 # ============================================================
 
 PARALLEL_DECOMP_PROMPT = """
-Decompose this comparison question into independent Wikipedia search queries.
+Decompose this comparison question into independent search queries.
 
 Important:
 - Generate ALL required search queries now.
 - The queries will be executed simultaneously.
-- Therefore no query may depend on the result of another query.
-- Usually 2 queries are enough for HotpotQA comparison questions.
-- Use 2 to 4 concise Wikipedia search queries.
+- No query may depend on another search result.
+- Usually 2 queries are enough.
+- Use 2 to 4 concise search queries.
 - Do NOT answer the original question.
-- Do NOT create a multi-step plan.
+- Do NOT create a sequential plan.
 - Do NOT use placeholders.
 - Return JSON only.
 
@@ -666,10 +932,9 @@ def run_parallel_decomposition(
     stats,
     model,
 ):
-
-    # --------------------------------------------
-    # one-shot decomposition
-    # --------------------------------------------
+    # --------------------------------------------------------
+    # ONE-SHOT DECOMPOSITION
+    # --------------------------------------------------------
 
     raw = call_llm(
         [
@@ -691,7 +956,9 @@ def run_parallel_decomposition(
         max_tokens=300,
     )
 
-    plan = extract_json(raw)
+    plan = extract_json(
+        raw
+    )
 
     queries = (
         plan.get(
@@ -717,14 +984,13 @@ def run_parallel_decomposition(
     ]
 
     if not queries:
-
         queries = [
             question
         ]
 
-    # --------------------------------------------
-    # TRUE PARALLEL SEARCH
-    # --------------------------------------------
+    # --------------------------------------------------------
+    # TRUE PARALLEL LOCAL RETRIEVAL
+    # --------------------------------------------------------
 
     evidence_by_index = {}
 
@@ -744,11 +1010,11 @@ def run_parallel_decomposition(
         for idx, query in enumerate(
             queries
         ):
-
             future = executor.submit(
-                wikipedia_search,
+                retrieve,
                 query,
                 stats,
+                TOP_K,
             )
 
             futures[
@@ -761,9 +1027,10 @@ def run_parallel_decomposition(
         for future in as_completed(
             futures
         ):
-
             idx, query = (
-                futures[future]
+                futures[
+                    future
+                ]
             )
 
             docs = (
@@ -805,20 +1072,18 @@ def run_parallel_decomposition(
         model,
     )
 
-    trace = {
-        "queries":
-            queries,
-
-        "parallel_search_wall_latency":
-            parallel_search_wall_latency,
-
-        "evidence":
-            evidence,
-    }
-
     return (
         answer,
-        trace,
+        {
+            "queries":
+                queries,
+
+            "parallel_search_wall_latency":
+                parallel_search_wall_latency,
+
+            "evidence":
+                evidence,
+        }
     )
 
 
@@ -828,33 +1093,33 @@ def run_parallel_decomposition(
 # ============================================================
 
 REACT_PROMPT = """
-You are answering a question by searching Wikipedia.
+You are answering a question using a local document search tool.
 
 Question:
 {question}
 
-Search history:
+Previous search trajectory:
 {history}
 
 Choose exactly ONE next action.
 
-If you need more information:
+If more information is needed:
 
 {{
   "action": "search",
   "query": "..."
 }}
 
-If the evidence is sufficient:
+If the retrieved evidence is sufficient:
 
 {{
   "action": "finish"
 }}
 
 Rules:
-- Search one query per turn.
-- Use previous search results when deciding the next action.
-- Do not answer the question yet.
+- Search exactly one query per turn.
+- Use previous observations to decide the next query.
+- Do not answer the original question here.
 - Avoid repeating queries.
 - Return JSON only.
 """
@@ -865,28 +1130,20 @@ def run_react(
     stats,
     model,
 ):
-
     trajectory = []
-
     evidence_parts = []
-
     queries = []
 
-    for step in range(
+    for _ in range(
         MAX_REACT_STEPS
     ):
-
-        if trajectory:
-
-            history = (
-                "\n\n".join(
-                    trajectory
-                )
+        history = (
+            "\n\n".join(
+                trajectory
             )
-
-        else:
-
-            history = "(none)"
+            if trajectory
+            else "(none)"
+        )
 
         raw = call_llm(
             [
@@ -914,26 +1171,20 @@ def run_react(
         )
 
         action_type = (
-            action.get(
-                "action",
-                ""
+            str(
+                action.get(
+                    "action",
+                    ""
+                )
             )
+            .strip()
+            .lower()
         )
 
-        if (
-            action_type
-            ==
-            "finish"
-        ):
-
+        if action_type == "finish":
             break
 
-        if (
-            action_type
-            !=
-            "search"
-        ):
-
+        if action_type != "search":
             break
 
         query = str(
@@ -944,21 +1195,19 @@ def run_react(
         ).strip()
 
         if not query:
-
             break
 
-        # duplicate query stop
         if query in queries:
-
             break
 
         queries.append(
             query
         )
 
-        docs = wikipedia_search(
+        docs = retrieve(
             query,
             stats,
+            TOP_K,
         )
 
         evidence = docs_to_text(
@@ -996,32 +1245,29 @@ def run_react(
         model,
     )
 
-    trace = {
-        "queries":
-            queries,
-
-        "trajectory":
-            trajectory,
-
-        "evidence":
-            evidence,
-    }
-
     return (
         answer,
-        trace,
+
+        {
+            "queries":
+                queries,
+
+            "trajectory":
+                trajectory,
+
+            "evidence":
+                evidence,
+        }
     )
 
 
 # ============================================================
 # METRICS
-# HotpotQA style
 # ============================================================
 
 def normalize_answer(s):
 
     def remove_articles(text):
-
         return re.sub(
             r"\b(a|an|the)\b",
             " ",
@@ -1029,7 +1275,6 @@ def normalize_answer(s):
         )
 
     def remove_punc(text):
-
         exclude = set(
             string.punctuation
         )
@@ -1041,7 +1286,6 @@ def normalize_answer(s):
         )
 
     def white_space_fix(text):
-
         return " ".join(
             text.split()
         )
@@ -1056,7 +1300,9 @@ def normalize_answer(s):
 
     return white_space_fix(
         remove_articles(
-            remove_punc(s)
+            remove_punc(
+                s
+            )
         )
     )
 
@@ -1065,7 +1311,6 @@ def exact_match(
     prediction,
     gold,
 ):
-
     return int(
         normalize_answer(
             prediction
@@ -1081,15 +1326,14 @@ def f1_score(
     prediction,
     gold,
 ):
-
-    pred = (
+    pred_tokens = (
         normalize_answer(
             prediction
         )
         .split()
     )
 
-    gold = (
+    gold_tokens = (
         normalize_answer(
             gold
         )
@@ -1097,35 +1341,39 @@ def f1_score(
     )
 
     if (
-        not pred
+        not pred_tokens
         or
-        not gold
+        not gold_tokens
     ):
-
         return float(
-            pred == gold
+            pred_tokens
+            ==
+            gold_tokens
         )
 
     common = (
-        Counter(pred)
+        Counter(pred_tokens)
         &
-        Counter(gold)
+        Counter(gold_tokens)
     )
 
-    same = sum(
+    num_same = sum(
         common.values()
     )
 
-    if same == 0:
-
+    if num_same == 0:
         return 0.0
 
     precision = (
-        same / len(pred)
+        num_same
+        /
+        len(pred_tokens)
     )
 
     recall = (
-        same / len(gold)
+        num_same
+        /
+        len(gold_tokens)
     )
 
     return (
@@ -1144,120 +1392,13 @@ def f1_score(
 
 
 # ============================================================
-# DATASET
-# ============================================================
-
-def load_hotpot_comparison(
-    n=100,
-    seed=SEED,
-):
-
-    print()
-    print("=" * 100)
-    print(
-        "LOAD HOTPOTQA "
-        "COMPARISON SUBSET"
-    )
-    print("=" * 100)
-
-    # validation = 7405 examples
-    ds = load_dataset(
-        "hotpotqa/hotpot_qa",
-        "distractor",
-        split="validation",
-    )
-
-    print(
-        "all validation:",
-        len(ds)
-    )
-
-    # ONLY COMPARISON
-    ds = ds.filter(
-        lambda x:
-            x["type"]
-            ==
-            "comparison"
-    )
-
-    print(
-        "comparison:",
-        len(ds)
-    )
-
-    # deterministic
-    ds = ds.shuffle(
-        seed=seed
-    )
-
-    if n > len(ds):
-
-        n = len(ds)
-
-    ds = ds.select(
-        range(n)
-    )
-
-    samples = []
-
-    for row in ds:
-
-        samples.append({
-            "id":
-                row["id"],
-
-            "question":
-                row["question"],
-
-            "answer":
-                row["answer"],
-
-            "type":
-                row["type"],
-
-            "level":
-                row["level"],
-        })
-
-    print()
-    print(
-        f"selected={len(samples)} "
-        f"seed={seed}"
-    )
-
-    print()
-    print("[EXAMPLES]")
-
-    for x in samples[:5]:
-
-        print()
-        print(
-            "Q:",
-            x["question"]
-        )
-
-        print(
-            "A:",
-            x["answer"]
-        )
-
-        print(
-            "level:",
-            x["level"]
-        )
-
-    return samples
-
-
-# ============================================================
-# SAVE EVAL MANIFEST
+# MANIFEST
 # ============================================================
 
 def save_manifest(
     samples,
     output_dir,
 ):
-
     path = os.path.join(
         output_dir,
         "eval_manifest.csv",
@@ -1278,7 +1419,7 @@ def save_manifest(
 
 
 # ============================================================
-# ONE SAMPLE
+# RUN SINGLE SAMPLE
 # ============================================================
 
 def run_one_sample(
@@ -1286,21 +1427,17 @@ def run_one_sample(
     sample,
     model,
 ):
-
     stats = RunStats()
+
+    prediction = ""
+    trace = {}
 
     start = (
         time.perf_counter()
     )
 
     try:
-
-        if (
-            method
-            ==
-            "parallel_decomp"
-        ):
-
+        if method == "parallel_decomp":
             prediction, trace = (
                 run_parallel_decomposition(
                     sample["question"],
@@ -1309,12 +1446,7 @@ def run_one_sample(
                 )
             )
 
-        elif (
-            method
-            ==
-            "react"
-        ):
-
+        elif method == "react":
             prediction, trace = (
                 run_react(
                     sample["question"],
@@ -1324,7 +1456,6 @@ def run_one_sample(
             )
 
         else:
-
             raise ValueError(
                 method
             )
@@ -1348,19 +1479,13 @@ def run_one_sample(
         error = None
 
     except Exception:
-
         wall_latency = (
             time.perf_counter()
             -
             start
         )
 
-        prediction = ""
-
-        trace = {}
-
         em = 0
-
         f1 = 0
 
         error = (
@@ -1374,7 +1499,9 @@ def run_one_sample(
             sample["id"]
         )
 
-        print(error)
+        print(
+            error
+        )
 
     return {
         "id":
@@ -1397,6 +1524,16 @@ def run_one_sample(
 
         "prediction":
             prediction,
+
+        "normalized_gold":
+            normalize_answer(
+                sample["answer"]
+            ),
+
+        "normalized_prediction":
+            normalize_answer(
+                prediction
+            ),
 
         "em":
             em,
@@ -1421,7 +1558,7 @@ def run_one_sample(
 
 
 # ============================================================
-# METHOD BENCHMARK
+# RUN METHOD
 # ============================================================
 
 def run_method_parallel(
@@ -1431,7 +1568,6 @@ def run_method_parallel(
     workers,
     output_dir,
 ):
-
     print()
     print("=" * 110)
 
@@ -1454,7 +1590,6 @@ def run_method_parallel(
         for index, sample in enumerate(
             samples
         ):
-
             future = executor.submit(
                 run_one_sample,
                 method,
@@ -1464,12 +1599,15 @@ def run_method_parallel(
 
             futures[
                 future
-            ] = index
+            ] = (
+                index,
+                sample,
+            )
 
-        running_em = 0
-        running_f1 = 0
-        errors = 0
         count = 0
+        running_em = 0.0
+        running_f1 = 0.0
+        errors = 0
 
         pbar = tqdm(
             total=len(samples),
@@ -1479,14 +1617,87 @@ def run_method_parallel(
         for future in as_completed(
             futures
         ):
-
-            index = futures[
+            (
+                index,
+                sample,
+            ) = futures[
                 future
             ]
 
-            row = (
-                future.result()
-            )
+            try:
+                row = future.result()
+
+            except Exception:
+                err = (
+                    traceback.format_exc()
+                )
+
+                row = {
+                    "id":
+                        sample["id"],
+
+                    "type":
+                        sample["type"],
+
+                    "level":
+                        sample["level"],
+
+                    "method":
+                        method,
+
+                    "question":
+                        sample["question"],
+
+                    "gold":
+                        sample["answer"],
+
+                    "prediction":
+                        "",
+
+                    "normalized_gold":
+                        normalize_answer(
+                            sample["answer"]
+                        ),
+
+                    "normalized_prediction":
+                        "",
+
+                    "em":
+                        0,
+
+                    "f1":
+                        0,
+
+                    "wall_latency":
+                        0,
+
+                    "llm_calls":
+                        0,
+
+                    "search_calls":
+                        0,
+
+                    "prompt_tokens":
+                        0,
+
+                    "completion_tokens":
+                        0,
+
+                    "llm_latency":
+                        0,
+
+                    "search_latency":
+                        0,
+
+                    "executed_steps":
+                        0,
+
+                    "error":
+                        err,
+
+                    "trace":
+                        "{}",
+                }
 
             rows_by_index[
                 index
@@ -1503,17 +1714,19 @@ def run_method_parallel(
             )
 
             if row["error"]:
-
                 errors += 1
 
             pbar.set_postfix(
                 EM=(
                     f"{running_em/count:.3f}"
                 ),
+
                 F1=(
                     f"{running_f1/count:.3f}"
                 ),
-                err=errors,
+
+                err=
+                    errors,
             )
 
             pbar.update(1)
@@ -1542,7 +1755,14 @@ def run_method_parallel(
     )
 
     print()
+    print("-" * 100)
     print("[RESULT]")
+    print("-" * 100)
+
+    print(
+        "N              :",
+        len(df)
+    )
 
     print(
         "EM             :",
@@ -1556,37 +1776,51 @@ def run_method_parallel(
 
     print(
         "search calls   :",
-        df["search_calls"].mean()
+        df[
+            "search_calls"
+        ].mean()
     )
 
     print(
         "LLM calls      :",
-        df["llm_calls"].mean()
+        df[
+            "llm_calls"
+        ].mean()
+    )
+
+    print(
+        "executed steps :",
+        df[
+            "executed_steps"
+        ].mean()
     )
 
     print(
         "wall latency   :",
-        df["wall_latency"].mean()
+        df[
+            "wall_latency"
+        ].mean()
     )
 
     print(
         "LLM latency    :",
-        df["llm_latency"].mean()
+        df[
+            "llm_latency"
+        ].mean()
     )
 
     print(
         "search latency :",
-        df["search_latency"].mean()
-    )
-
-    print(
-        "steps          :",
-        df["executed_steps"].mean()
+        df[
+            "search_latency"
+        ].mean()
     )
 
     print(
         "errors         :",
-        df["error"].notna().sum()
+        df[
+            "error"
+        ].notna().sum()
     )
 
     print(
@@ -1598,7 +1832,171 @@ def run_method_parallel(
 
 
 # ============================================================
-# PAIRED COMPARISON
+# SUMMARY
+# ============================================================
+
+def save_summary(
+    dfs,
+    output_dir,
+):
+    rows = []
+
+    for method, df in dfs.items():
+
+        rows.append({
+            "method":
+                method,
+
+            "n":
+                len(df),
+
+            "EM":
+                df["em"].mean(),
+
+            "F1":
+                df["f1"].mean(),
+
+            "search_calls":
+                df[
+                    "search_calls"
+                ].mean(),
+
+            "llm_calls":
+                df[
+                    "llm_calls"
+                ].mean(),
+
+            "executed_steps":
+                df[
+                    "executed_steps"
+                ].mean(),
+
+            "wall_latency":
+                df[
+                    "wall_latency"
+                ].mean(),
+
+            "llm_latency":
+                df[
+                    "llm_latency"
+                ].mean(),
+
+            "search_latency":
+                df[
+                    "search_latency"
+                ].mean(),
+
+            "prompt_tokens":
+                df[
+                    "prompt_tokens"
+                ].mean(),
+
+            "completion_tokens":
+                df[
+                    "completion_tokens"
+                ].mean(),
+
+            "errors":
+                df[
+                    "error"
+                ].notna().sum(),
+        })
+
+    summary = pd.DataFrame(
+        rows
+    )
+
+    path = os.path.join(
+        output_dir,
+        "summary.csv",
+    )
+
+    summary.to_csv(
+        path,
+        index=False,
+    )
+
+    print()
+    print("=" * 140)
+    print("FINAL SUMMARY")
+    print("=" * 140)
+
+    print(
+        summary.to_string(
+            index=False
+        )
+    )
+
+    print()
+    print(
+        "saved:",
+        path
+    )
+
+    return summary
+
+
+# ============================================================
+# VERIFY SAME EVAL SET
+# ============================================================
+
+def verify_same_eval(
+    parallel_df,
+    react_df,
+):
+    cols = [
+        "id",
+        "question",
+        "gold",
+    ]
+
+    a = (
+        parallel_df[
+            cols
+        ]
+        .astype(str)
+        .reset_index(
+            drop=True
+        )
+    )
+
+    b = (
+        react_df[
+            cols
+        ]
+        .astype(str)
+        .reset_index(
+            drop=True
+        )
+    )
+
+    same = a.equals(
+        b
+    )
+
+    print()
+    print("=" * 100)
+    print("VERIFY SAME EVAL SET")
+    print("=" * 100)
+
+    print(
+        "same:",
+        same
+    )
+
+    print(
+        "parallel n:",
+        len(a)
+    )
+
+    print(
+        "react n:",
+        len(b)
+    )
+
+
+# ============================================================
+# PAIRED ANALYSIS
 # ============================================================
 
 def paired_analysis(
@@ -1606,11 +2004,12 @@ def paired_analysis(
     react_df,
     output_dir,
 ):
-
     a = (
         parallel_df[
             [
                 "id",
+                "question",
+                "gold",
                 "em",
                 "f1",
                 "prediction",
@@ -1681,6 +2080,7 @@ def paired_analysis(
         b,
         on="id",
         how="inner",
+        validate="one_to_one",
     )
 
     merged[
@@ -1715,6 +2115,32 @@ def paired_analysis(
         (merged["react_em"] == 0)
     )
 
+    merged[
+        "f1_delta"
+    ] = (
+        merged[
+            "parallel_f1"
+        ]
+        -
+        merged[
+            "react_f1"
+        ]
+    )
+
+    merged[
+        "latency_speedup"
+    ] = (
+        merged[
+            "react_latency"
+        ]
+        /
+        merged[
+            "parallel_latency"
+        ].clip(
+            lower=1e-9
+        )
+    )
+
     path = os.path.join(
         output_dir,
         "paired.csv",
@@ -1726,56 +2152,78 @@ def paired_analysis(
     )
 
     print()
-    print("=" * 100)
+    print("=" * 120)
     print("PAIRED ANALYSIS")
-    print("=" * 100)
+    print("=" * 120)
 
     print(
         "parallel only correct:",
-        merged[
-            "parallel_only_correct"
-        ].sum()
+        int(
+            merged[
+                "parallel_only_correct"
+            ].sum()
+        )
     )
 
     print(
         "react only correct   :",
-        merged[
-            "react_only_correct"
-        ].sum()
+        int(
+            merged[
+                "react_only_correct"
+            ].sum()
+        )
     )
 
     print(
         "both correct         :",
-        merged[
-            "both_correct"
-        ].sum()
+        int(
+            merged[
+                "both_correct"
+            ].sum()
+        )
     )
 
     print(
         "both wrong           :",
-        merged[
-            "both_wrong"
-        ].sum()
+        int(
+            merged[
+                "both_wrong"
+            ].sum()
+        )
     )
 
     print()
+    print(
+        "parallel F1:",
+        merged[
+            "parallel_f1"
+        ].mean()
+    )
 
     print(
-        "parallel avg latency :",
+        "react F1   :",
+        merged[
+            "react_f1"
+        ].mean()
+    )
+
+    print()
+    print(
+        "parallel latency:",
         merged[
             "parallel_latency"
         ].mean()
     )
 
     print(
-        "react avg latency    :",
+        "react latency   :",
         merged[
             "react_latency"
         ].mean()
     )
 
     print(
-        "speedup              :",
+        "react / parallel speedup:",
         (
             merged[
                 "react_latency"
@@ -1787,92 +2235,54 @@ def paired_analysis(
         )
     )
 
+    # --------------------------------------------------------
+    # PARALLEL-ONLY EXAMPLES
+    # --------------------------------------------------------
+
+    wins = (
+        merged[
+            merged[
+                "parallel_only_correct"
+            ]
+        ]
+    )
+
+    if len(wins):
+        print()
+        print("=" * 120)
+        print("PARALLEL ONLY CORRECT EXAMPLES")
+        print("=" * 120)
+
+        for _, row in (
+            wins.head(10)
+            .iterrows()
+        ):
+            print()
+            print(
+                "Q:",
+                row["question"]
+            )
+
+            print(
+                "GOLD:",
+                row["gold"]
+            )
+
+            print(
+                "PARALLEL:",
+                row[
+                    "parallel_prediction"
+                ]
+            )
+
+            print(
+                "REACT:",
+                row[
+                    "react_prediction"
+                ]
+            )
+
     return merged
-
-
-# ============================================================
-# SUMMARY
-# ============================================================
-
-def save_summary(
-    dfs,
-    output_dir,
-):
-
-    rows = []
-
-    for method, df in dfs.items():
-
-        rows.append({
-            "method":
-                method,
-
-            "n":
-                len(df),
-
-            "EM":
-                df["em"].mean(),
-
-            "F1":
-                df["f1"].mean(),
-
-            "search_calls":
-                df[
-                    "search_calls"
-                ].mean(),
-
-            "llm_calls":
-                df[
-                    "llm_calls"
-                ].mean(),
-
-            "wall_latency":
-                df[
-                    "wall_latency"
-                ].mean(),
-
-            "prompt_tokens":
-                df[
-                    "prompt_tokens"
-                ].mean(),
-
-            "completion_tokens":
-                df[
-                    "completion_tokens"
-                ].mean(),
-
-            "errors":
-                df[
-                    "error"
-                ].notna().sum(),
-        })
-
-    summary = pd.DataFrame(
-        rows
-    )
-
-    path = os.path.join(
-        output_dir,
-        "summary.csv",
-    )
-
-    summary.to_csv(
-        path,
-        index=False,
-    )
-
-    print()
-    print("=" * 120)
-    print("FINAL SUMMARY")
-    print("=" * 120)
-
-    print(
-        summary.to_string(
-            index=False
-        )
-    )
-
-    return summary
 
 
 # ============================================================
@@ -1880,6 +2290,7 @@ def save_summary(
 # ============================================================
 
 def main():
+    global corpus
 
     parser = argparse.ArgumentParser()
 
@@ -1918,7 +2329,12 @@ def main():
     parser.add_argument(
         "--output-dir",
         default=
-            "./parallel_vs_react_results",
+            "./parallel_vs_react_local_results",
+    )
+
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
     )
 
     parser.add_argument(
@@ -1938,38 +2354,61 @@ def main():
     )
 
     print("=" * 120)
+
     print(
-        "VANILLA PARALLEL DECOMPOSITION "
+        "LOCAL FAISS "
+        "PARALLEL DECOMPOSITION "
         "VS REACT"
     )
+
     print("=" * 120)
 
     print(
-        "model  :",
+        "LLM model   :",
         args.model
     )
 
     print(
-        "n      :",
+        "embed model :",
+        EMBED_MODEL_NAME
+    )
+
+    print(
+        "n           :",
         args.n
     )
 
     print(
-        "seed   :",
+        "seed        :",
         args.seed
     )
 
     print(
-        "workers:",
+        "workers     :",
         args.workers
     )
 
+    print(
+        "top-k       :",
+        TOP_K
+    )
+
+    print(
+        "reasoning   :",
+        False
+    )
+
     # ========================================================
-    # FIXED EVAL SET
+    # DATA
     # ========================================================
+
+    ds = (
+        load_hotpot_validation()
+    )
 
     samples = (
         load_hotpot_comparison(
+            ds=ds,
             n=args.n,
             seed=args.seed,
         )
@@ -1980,11 +2419,38 @@ def main():
         args.output_dir,
     )
 
-    dfs = {}
+    # ========================================================
+    # EMBEDDER
+    # ========================================================
+
+    initialize_embedder()
 
     # ========================================================
-    # METHODS
+    # INDEX
     # ========================================================
+
+    cache_ok = (
+        load_cached_index()
+        if not args.rebuild_index
+        else False
+    )
+
+    if not cache_ok:
+        corpus = build_corpus(
+            ds
+        )
+
+        build_faiss_index(
+            corpus
+        )
+
+        save_index_and_corpus()
+
+    # ========================================================
+    # RUN
+    # ========================================================
+
+    dfs = {}
 
     for method in args.methods:
 
@@ -2029,6 +2495,15 @@ def main():
         "react"
         in dfs
     ):
+        verify_same_eval(
+            dfs[
+                "parallel_decomp"
+            ],
+
+            dfs[
+                "react"
+            ],
+        )
 
         paired_analysis(
             dfs[
@@ -2044,5 +2519,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
