@@ -199,3 +199,19 @@ ReAct
 ```
 
 특히 ReAct의 `EM/F1`, search calls, LLM calls가 나오면 **“처음에 전체 plan을 세우는 게 좋은가, observation마다 다음 행동을 결정하는 게 좋은가”**를 직접 비교할 수 있다.
+
+## HotpotQA Comparison — Parallel Decomposition vs ReAct
+
+동일한 평가셋 100개를 사용했으며, `parallel_decomp`와 `ReAct` 모두 정확히 같은 질문·정답 쌍으로 평가했다.
+
+| Method                     |      EM |        F1 | Avg. Latency |
+| -------------------------- | ------: | --------: | -----------: |
+| **Parallel Decomposition** |     79% |     0.863 |    **2.65s** |
+| **ReAct**                  | **81%** | **0.881** |        5.00s |
+
+Paired 결과는 `parallel only correct = 2`, `react only correct = 4`, `both correct = 77`, `both wrong = 17`이었다. 즉 정확도에서는 ReAct가 근소하게 우세했지만, 차이는 매우 작았다. 반면 latency는 Parallel Decomposition이 **2.65초**, ReAct가 **5.00초**로, Parallel 방식이 약 **1.88배 빠른 응답 속도**를 보였다.
+
+특히 Parallel Decomposition만 맞춘 사례도 존재했다. 예를 들어 `Zakk Wylde and Damon Albarn are both what?`에서 Parallel은 정답인 `singer, songwriter, and multi-instrumentalist`를 맞췄지만 ReAct는 `musicians`로 지나치게 일반화했다. 또한 `which is larger, Hunchun or Shijiazhuang?`에서는 Parallel이 `Shijiazhuang`을 맞춘 반면 ReAct는 `Hunchun`으로 오답을 냈다.
+
+결론적으로 **comparison-type multi-hop QA에서는 단순한 upfront decomposition + 병렬 retrieval만으로도 ReAct와 거의 비슷한 정확도를 유지하면서 wall-clock latency를 절반 수준으로 줄일 수 있었다.** 다만 정확도 자체는 이번 실험에서는 ReAct가 F1 기준 약 **+0.018** 높아, Parallel Decomposition의 주요 이점은 정확도 향상보다는 **효율성과 응답 속도**에 있다고 볼 수 있다.
+
